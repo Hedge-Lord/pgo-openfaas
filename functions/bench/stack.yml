@@ -1,0 +1,21 @@
+version: 1.0
+provider:
+  name: openfaas
+  gateway: http://127.0.0.1:8080
+
+functions:
+  bench:
+    image: localhost:5000/bench:latest
+    skip_build: true
+    environment:
+      write_timeout: 60s
+      read_timeout: 60s
+      exec_timeout: 60s
+
+  bench-pgo:
+    image: localhost:5000/bench-pgo:latest
+    skip_build: true
+    environment:
+      write_timeout: 60s
+      read_timeout: 60s
+      exec_timeout: 60s 
