@@ -1,133 +1,97 @@
 #!/bin/bash
 set -e
 
-# Colors for output
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+# ────────── styling helpers ─────────────────────────────────────────
+GREEN='\033[0;32m'; RED='\033[0;31m'; BLUE='\033[0;34m'; NC='\033[0m'
+header() { echo -e "${GREEN}$1${NC}"; }
+step()   { echo -e "${BLUE}Step $1: $2${NC}"; }
+info()   { echo -e "${BLUE}$1${NC}"; }
+ok()     { echo -e "${GREEN}$1${NC}"; }
+die()    { echo -e "${RED}$1${NC}"; exit 1; }
 
-# Configuration
+# ────────── config ──────────────────────────────────────────────────
 GATEWAY="http://127.0.0.1:8080"
-ITERATIONS=500000
+ITERATIONS="${1:-500000}"   # inner‑loop work
+REQS="${2:-1000}"           # total requests per hey run
+CONC="${3:-20}"             # concurrency
 COMPLEXITY=4
-BENCHMARK_REQUESTS=1000
-BENCHMARK_CONCURRENCY=20
 
-echo -e "${GREEN}Starting PGO experiment...${NC}"
-
-# Navigate to function directory
-cd functions/bench
-
-# Step 1: Build and deploy baseline function
-echo -e "${BLUE}Step 1: Building and deploying baseline function...${NC}"
-docker build -t bench:latest .
-docker tag bench:latest localhost:5000/bench:latest
-docker push localhost:5000/bench:latest
-faas-cli deploy -f stack.yml --filter bench
-
-# Wait for function to be ready
-echo -e "${BLUE}Waiting for function to be ready...${NC}"
-sleep 5
-
-# Step 2: Test function
-echo -e "${BLUE}Step 2: Testing function...${NC}"
-RESPONSE=$(curl -s -X POST -d "{\"iterations\":${ITERATIONS},\"complexity\":${COMPLEXITY},\"name\":\"test\"}" ${GATEWAY}/function/bench)
-echo "Function response: $RESPONSE"
-
-# Step 3: Collect profile
-echo -e "${BLUE}Step 3: Warming up & collecting profile...${NC}"
-hey -n ${BENCHMARK_REQUESTS} -c ${BENCHMARK_CONCURRENCY} -m POST \
-  -H "Content-Type: application/json" \
-  -d "{\"iterations\":${ITERATIONS},\"complexity\":${COMPLEXITY},\"name\":\"profile\"}" \
-  ${GATEWAY}/function/bench > /dev/null
-sudo nerdctl --namespace=openfaas-fn kill -s SIGTERM bench
-
-# Give Go a moment to generate the profile
-echo "Waiting for profile generation..."
-sleep 2
-
-# Extract the profile
-sudo nerdctl --namespace=openfaas-fn cp bench:/tmp/cpu.pprof ./cpu.pprof
-
-# Check if profile was generated
-if [ ! -f ./cpu.pprof ]; then
-    echo -e "${RED}Error: Profile was not generated.${NC}"
-    exit 1
-fi
-
-echo -e "${GREEN}Profile collected: $(ls -lh cpu.pprof)${NC}"
-
-# Convert profile to PGO format
-go tool pprof -proto cpu.pprof > default.pgo
-echo -e "${GREEN}Profile converted to PGO format.${NC}"
-
-# Step 4: Build and deploy PGO version
-echo -e "${BLUE}Step 4: Building and deploying PGO version...${NC}"
-docker build -t bench-pgo:latest -f Dockerfile.pgo .
-docker tag bench-pgo:latest localhost:5000/bench-pgo:latest
-docker push localhost:5000/bench-pgo:latest
-faas-cli deploy -f stack.yml --filter bench-pgo
-
-# Wait for PGO function to be ready
-echo -e "${BLUE}Waiting for PGO function to be ready...${NC}"
-sleep 5
-
-# Step 5: Benchmark and compare
-echo -e "${BLUE}Step 5: Benchmarking and comparing...${NC}"
-
-# Make sure hey is installed
-if ! command -v hey &> /dev/null; then
-    echo -e "${RED}hey not found. Installing...${NC}"
-    go install github.com/rakyll/hey@latest
-fi
-
-# Benchmark baseline version
-echo -e "${BLUE}Benchmarking baseline version...${NC}"
-hey -n ${BENCHMARK_REQUESTS} -c ${BENCHMARK_CONCURRENCY} -m POST \
-  -H "Content-Type: application/json" \
-  -d "{\"iterations\":${ITERATIONS},\"complexity\":${COMPLEXITY},\"name\":\"test\"}" \
-  ${GATEWAY}/function/bench > baseline_results.txt
-
-# Benchmark PGO version
-echo -e "${BLUE}Benchmarking PGO version...${NC}"
-hey -n ${BENCHMARK_REQUESTS} -c ${BENCHMARK_CONCURRENCY} -m POST \
-  -H "Content-Type: application/json" \
-  -d "{\"iterations\":${ITERATIONS},\"complexity\":${COMPLEXITY},\"name\":\"test\"}" \
-  ${GATEWAY}/function/bench-pgo > pgo_results.txt
-
-# Compare results
-echo -e "${GREEN}Results comparison:${NC}"
-echo -e "${BLUE}Baseline Results:${NC}"
-grep "Average" -A 5 baseline_results.txt
-
-echo -e "${BLUE}PGO Results:${NC}"
-grep "Average" -A 5 pgo_results.txt
-
-parse_p95 () {
-  # $1 = results file
-  awk '/ 95% in / { print $3 }' "$1"
+# ────────── generic parsers  (100 % awk) ────────────────────────────
+parse() {                 # file metric
+  case $2 in
+    avg) awk '$1=="Average:"      {print $2}'      "$1";;
+    p95) awk '$1=="95%"           {print $(NF-1)}' "$1";;
+    p99) awk '$1=="99%"           {print $(NF-1)}' "$1";;
+    rps) awk '$1=="Requests/sec:" {print $2}'      "$1";;
+  esac
 }
 
-# Calculate improvement percentage
-BASELINE_AVG=$(grep "Average:" baseline_results.txt | awk '{print $2}')
-PGO_AVG=$(grep "Average:" pgo_results.txt | awk '{print $2}')
-IMPROVEMENT=$(echo "scale=2; (($BASELINE_AVG - $PGO_AVG) / $BASELINE_AVG) * 100" | bc)
+# ────────── deps ────────────────────────────────────────────────────
+command -v hey >/dev/null || { info "Installing hey…"; go install github.com/rakyll/hey@latest; }
 
-BASELINE_P95=$(parse_p95 baseline_results.txt)
-PGO_P95=$(parse_p95 pgo_results.txt)
-P95_IMPROV=$(echo "scale=2; (($BASELINE_P95 - $PGO_P95) / $BASELINE_P95) * 100" | bc)
+# ────────── build/deploy helpers ────────────────────────────────────
+build_and_deploy () {      # fn dockerfile
+  local fn=$1; shift
+  local df=$1; shift || true
+  info "Building $fn …"
+  docker build -t $fn:latest ${df:+-f $df} . >/dev/null
+  docker tag  $fn:latest localhost:5000/$fn:latest
+  docker push localhost:5000/$fn:latest   >/dev/null
+  faas-cli deploy -f stack.yml --filter $fn --gateway $GATEWAY
+  sleep 3
+}
 
-echo -e "${GREEN}Average latency improvement: ${AVG_IMPROV}%${NC}"
-echo -e "${GREEN}p95 latency improvement:     ${P95_IMPROV}%${NC}"
+bench () {                 # fn outfile
+  hey -n $REQS -c $CONC -m POST \
+      -H 'Content-Type: application/json' \
+      -d "{\"iterations\":$ITERATIONS,\"complexity\":$COMPLEXITY}" \
+      $GATEWAY/function/$1 > "$2"
+}
 
-# Optional cleanup
-read -p "Do you want to clean up the deployed functions? (y/n) " -n 1 -r
+# ────────── main flow ───────────────────────────────────────────────
+cd functions/bench || die "run from repo root"
+
+header "Starting PGO experiment"
+
+# baseline build/prof‑warm
+step 1 "build & deploy baseline"
+build_and_deploy bench Dockerfile
+
+step 2 "profile warm‑up"
+hey -n $REQS -c $CONC -m POST \
+    -H 'Content-Type: application/json' \
+    -d "{\"iterations\":$ITERATIONS,\"complexity\":$COMPLEXITY}" \
+    $GATEWAY/function/bench >/dev/null
+sudo nerdctl --namespace=openfaas-fn kill -s SIGTERM bench
+sleep 2
+sudo nerdctl --namespace=openfaas-fn cp bench:/tmp/cpu.pprof ./cpu.pprof || die "no profile"
+go tool pprof -proto cpu.pprof > default.pgo
+ok "profile captured & converted"
+
+# redeploy *fresh* baseline + PGO
+faas-cli remove -f stack.yml --filter bench --gateway $GATEWAY
+step 3 "deploy fresh baseline + pgo"
+build_and_deploy bench      Dockerfile
+build_and_deploy bench-pgo  Dockerfile.pgo
+
+# benchmark
+step 4 "benchmarking"
+bench bench     baseline.txt
+bench bench-pgo pgo.txt
+
+# compare
+BASE_AVG=$(parse baseline.txt avg); PGO_AVG=$(parse pgo.txt avg)
+BASE_P95=$(parse baseline.txt p95); PGO_P95=$(parse pgo.txt p95)
+
+AVG_WIN=$(echo "scale=2;($BASE_AVG-$PGO_AVG)/$BASE_AVG*100" | bc)
+P95_WIN=$(echo "scale=2;($BASE_P95-$PGO_P95)/$BASE_P95*100" | bc)
+
+ok  "Avg  latency improvement : ${AVG_WIN}%"
+ok  "p95  latency improvement : ${P95_WIN}%"
 echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    echo -e "${BLUE}Cleaning up...${NC}"
-    faas-cli remove -f stack.yml
-    echo -e "${GREEN}Cleanup complete.${NC}"
-fi
+info "Raw baseline:"
+grep -A5 "Average" baseline.txt
+info "Raw PGO:"
+grep -A5 "Average" pgo.txt
 
-echo -e "${GREEN}Experiment complete!${NC}" 
+faas-cli remove -f stack.yml --gateway $GATEWAY

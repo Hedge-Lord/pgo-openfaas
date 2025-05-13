@@ -3,23 +3,25 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"math"
+	"math/rand"
 	"os"
 	"os/signal"
+	"runtime"
 	"runtime/pprof"
 	"syscall"
 	"time"
 )
 
-// Request defines the input structure
+// ---------- Request/Response ----------
+
 type Request struct {
 	Iterations int    `json:"iterations"`
 	Complexity int    `json:"complexity"`
 	Name       string `json:"name"`
 }
 
-// Response defines the output structure
 type Response struct {
 	Result     float64 `json:"result"`
 	Duration   string  `json:"duration"`
@@ -27,98 +29,100 @@ type Response struct {
 	Name       string  `json:"name"`
 }
 
-// CPUIntensiveTask simulates a CPU-heavy workload with branches (good for PGO)
-func CPUIntensiveTask(iterations, complexity int) float64 {
-	result := 0.0
-	
-	// Ensure complexity is at least 3 to avoid division by zero
-	if complexity < 3 {
-		complexity = 3
-	}
-	
-	for i := 1; i < iterations+1; i++ { // Start from 1 to avoid log(0)
-		// Branchy code for PGO to optimize
-		if i%2 == 0 {
-			result += math.Sin(float64(i) * 0.01)
-		} else {
-			result += math.Cos(float64(i) * 0.01)
-		}
-		
-		// More branches
-		switch i % complexity {
-		case 0:
-			result += math.Sqrt(float64(i))
-		case 1:
-			result += math.Log(float64(i))
-		case 2:
-			result += math.Exp(math.Min(float64(i) * 0.01, 10.0)) // Limit exp input to avoid overflow
-		default:
-			result += float64(i) * 0.01
-		}
-	}
-	
-	// Handle potential infinity
-	if math.IsInf(result, 0) || math.IsNaN(result) {
-		return 0.0
-	}
-	
-	return result
-}
+// ---------- JSON parsing (cold) ----------
 
-// Handle processes the incoming request
-func Handle(ctx context.Context, in []byte) ([]byte, error) {
+func parseRequest(in []byte) (Request, error) {
 	var req Request
-	
-	// Default values
-	req.Iterations = 100000
+	req.Iterations = 100_000
 	req.Complexity = 4
 	req.Name = "world"
-	
-	// Try to parse JSON
-	_ = json.Unmarshal(in, &req)
-	
-	startTime := time.Now()
-	result := CPUIntensiveTask(req.Iterations, req.Complexity)
-	duration := time.Since(startTime)
-	
-	resp := Response{
-		Result:     result,
-		Duration:   duration.String(),
-		Iterations: req.Iterations,
-		Name:       req.Name,
+
+	if len(in) == 0 {
+		return req, nil
 	}
-	
+	if err := json.Unmarshal(in, &req); err != nil {
+		return req, err
+	}
+	if req.Complexity < 3 {
+		return req, errors.New("complexity must be ≥3")
+	}
+	return req, nil
+}
+
+// ---------- Hot numeric loop ----------
+
+//go:nosplit
+func cpuIntensive(iter, comp int) float64 {
+	var res float64
+	for i := 1; i <= iter; i++ {
+		// Cheap predictable branch
+		if i&1 == 0 {
+			res += math.Sin(float64(i) * 0.01)
+		} else {
+			res += math.Cos(float64(i) * 0.01)
+		}
+
+		// Intentional *rare* branch — ~1 % hit rate
+		if isRare(i) {
+			res += expensiveColdPath(i)
+			continue
+		}
+
+		switch i % comp {
+		case 0:
+			res += math.Sqrt(float64(i))
+		case 1:
+			res += math.Log(float64(i))
+		case 2:
+			res += math.Exp(math.Min(float64(i)*0.01, 10))
+		default:
+			res += float64(i) * 0.01
+		}
+	}
+	return res
+}
+
+// Marked noinline so PGO can keep it cold.
+//go:noinline
+func expensiveColdPath(i int) float64 {
+	// Pretend we call into a heavy lib once in a while
+	time.Sleep(time.Microsecond) // IO/GC‐ish pause
+	return math.Pow(float64(i), 1.3)
+}
+
+func isRare(i int) bool { return i%97 == 0 }
+
+// ---------- FaaS entry ----------
+
+func Handle(ctx context.Context, in []byte) ([]byte, error) {
+	req, err := parseRequest(in)
+	if err != nil {
+		return nil, err
+	}
+
+	start := time.Now()
+	val := cpuIntensive(req.Iterations, req.Complexity)
+	dur := time.Since(start)
+
+	resp := Response{val, dur.String(), req.Iterations, req.Name}
 	return json.Marshal(resp)
 }
 
-// init sets up pprof profiling on SIGTERM
+// ---------- Profiling bootstrap ----------
+
 func init() {
+	f, _ := os.Create("/tmp/cpu.pprof")
+	_ = pprof.StartCPUProfile(f)
+
 	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGTERM)
+	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-ch
-		fmt.Println("SIGTERM received, starting profile capture")
-		
-		f, err := os.Create("/tmp/cpu.pprof")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to create profile file: %v\n", err)
-			return
-		}
-		defer f.Close()
-		
-		if err := pprof.StartCPUProfile(f); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to start CPU profile: %v\n", err)
-			return
-		}
-		
-		// Simulate some load for profiling
-		CPUIntensiveTask(500000, 10)
-		
 		pprof.StopCPUProfile()
-		fmt.Println("Profile captured and written to /tmp/cpu.pprof")
-		
-		// Exit after profiling is complete
-		time.Sleep(100 * time.Millisecond)
+		f.Close()
+		runtime.GC() // flush profile buffers
 		os.Exit(0)
 	}()
-} 
+	// seed RNG once
+	rand.Seed(time.Now().UnixNano())
+}
