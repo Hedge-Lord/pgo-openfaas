@@ -1,56 +1,92 @@
-# PGO vs Plain AOT Experiment with OpenFaaS
+# PGO Experiment Steps
 
-Compare Profile-Guided Optimization (PGO) against plain Ahead-of-Time (AOT) compilation in Go functions running on OpenFaaS.
+These steps should be run on your CloudLab node after setting up OpenFaaS using `scripts/setup.sh`.
 
-## Status: Work in Progress
+## 0. Setup Local Docker Registry (if needed)
 
-This project is currently a work in progress. Some parts may need manual intervention.
+If OpenFaaS can't use local Docker images, set up a local registry:
 
-## Repository Structure
+```bash
+# Start a local registry
+docker run -d -p 5000:5000 --restart=always --name registry registry:2
 
-```
-.
-├── README.md
-├── STEPS.md           # Step-by-step experiment guide
-├── scripts/
-    └── run_experiment.sh  # Automated experiment script
-│   └── setup.sh       # Sets up OpenFaaS and dependencies
-└── functions/
-    └── bench/
-        ├── handler.go     # Go function with pprof profiling
-        ├── main.go        # Main function for HTTP server
-        ├── go.mod         # Go module file
-        ├── Dockerfile     # Standard build
-        ├── Dockerfile.pgo # PGO-optimized build
-        └── stack.yml      # OpenFaaS deployment config
+# Tag and push images to local registry
+docker tag bench:latest localhost:5000/bench:latest
+docker push localhost:5000/bench:latest
+
+# Update stack.yml to use local registry
+# Change image: bench:latest to image: localhost:5000/bench:latest
 ```
 
-## Quick Start
+## 1. Deploy Baseline Function
 
-1. **Setup OpenFaaS**:
-   ```bash
-   ./scripts/setup.sh
-   ```
-   This will install OpenFaaS and its dependencies. You may need to fix Docker issues manually.
+```bash
+cd functions/bench
+docker build -t bench:latest .
 
-2. **Run the experiment**:
-   ```bash
-   ./run_experiment.sh
-   ```
-   Or follow the manual steps in [STEPS.md](STEPS.md) for more control.
+# Tag for local registry
+docker tag bench:latest localhost:5000/bench:latest
+docker push localhost:5000/bench:latest
 
-## How It Works
+# Deploy
+faas-cli deploy -f stack.yml --filter bench
+```
 
-1. **Baseline Function**: Standard Go build
-2. **Profile Collection**: Captures CPU profile on SIGTERM using nerdctl
-3. **PGO Version**: Built with `-pgo` flag using the collected profile
-4. **Benchmark**: Compare performance between versions
+## 2. Test Function
 
-## Key Optimizations
+```bash
+curl -X POST -d '{"iterations":100000,"complexity":4,"name":"test"}' http://127.0.0.1:8080/function/bench
+```
 
-The experiment uses a CPU-intensive workload with branchy code that benefits from PGO:
-- Conditional branches (if/else)
-- Switch statements
-- Math functions with different execution paths
+## 3. Collect Profile
 
-PGO helps the compiler make better inlining, branch prediction, and code layout decisions based on actual execution patterns.
+```bash
+sudo nerdctl --namespace=openfaas-fn kill -s SIGTERM bench
+
+# Give Go a moment
+sleep 2
+
+sudo nerdctl --namespace=openfaas-fn cp bench:/tmp/cpu.pprof ./cpu.pprof
+
+# sanity‑check
+ls -lh cpu.pprof
+
+go tool pprof -proto cpu.pprof > default.pgo
+```
+
+## 4. Deploy PGO Version
+
+```bash
+docker build -t bench-pgo:latest -f Dockerfile.pgo .
+
+# Tag for local registry
+docker tag bench-pgo:latest localhost:5000/bench-pgo:latest
+docker push localhost:5000/bench-pgo:latest
+
+# Deploy
+faas-cli deploy -f stack.yml --filter bench-pgo
+```
+
+## 5. Benchmark and Compare
+
+```bash
+# Benchmark both versions
+hey -n 50 -c 1 -m POST -d '{"iterations":100000,"complexity":4,"name":"test"}' \
+  http://127.0.0.1:8080/function/bench > baseline_results.txt
+
+hey -n 50 -c 1 -m POST -d '{"iterations":100000,"complexity":4,"name":"test"}' \
+  http://127.0.0.1:8080/function/bench-pgo > pgo_results.txt
+
+# Compare results
+echo "Baseline Results:"
+cat baseline_results.txt | grep "Average" -A 5
+echo -e "\nPGO Results:"
+cat pgo_results.txt | grep "Average" -A 5
+```
+
+## 6. Cleanup
+
+```bash
+faas-cli remove -f stack.yml
+# docker stop registry && docker rm registry  # If you used a local registry
+``` 
