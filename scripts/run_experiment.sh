@@ -41,10 +41,11 @@ build_and_deploy () {      # fn dockerfile
   sleep 3
 }
 
-bench () {                 # fn outfile
+bench () {                 # fn outfile mode
+  local MODE=${3:-json}
   hey -n $REQS -c $CONC -m POST \
       -H 'Content-Type: application/json' \
-      -d "{\"iterations\":$ITERATIONS,\"complexity\":$COMPLEXITY}" \
+      -d "{\"iterations\":$ITERATIONS,\"name\":\"test\",\"mode\":\"$MODE\"}" \
       $GATEWAY/function/$1 > "$2"
 }
 
@@ -76,18 +77,22 @@ build_and_deploy bench-pgo  Dockerfile.pgo
 
 # benchmark
 step 4 "benchmarking"
-bench bench     baseline.txt
-bench bench-pgo pgo.txt
+bench bench     baseline.txt json
+bench bench-pgo pgo.txt json
 
 # compare
 BASE_AVG=$(parse baseline.txt avg); PGO_AVG=$(parse pgo.txt avg)
 BASE_P95=$(parse baseline.txt p95); PGO_P95=$(parse pgo.txt p95)
+BASE_P99=$(parse baseline.txt p99); PGO_P99=$(parse pgo.txt p99)
 
 AVG_WIN=$(echo "scale=2;($BASE_AVG-$PGO_AVG)/$BASE_AVG*100" | bc)
 P95_WIN=$(echo "scale=2;($BASE_P95-$PGO_P95)/$BASE_P95*100" | bc)
+P99_WIN=$(echo "scale=2;($BASE_P99-$PGO_P99)/$BASE_P99*100" | bc)
 
 ok  "Avg  latency improvement : ${AVG_WIN}%"
 ok  "p95  latency improvement : ${P95_WIN}%"
+ok  "p99  latency improvement : ${P99_WIN}%"
+
 echo
 info "Raw baseline:"
 grep -A5 "Average" baseline.txt
